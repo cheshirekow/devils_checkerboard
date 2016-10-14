@@ -1,4 +1,6 @@
+#ifdef __SSE4_1__
 #include <nmmintrin.h>
+#endif
 
 #include <cassert>
 #include <cstdint>
@@ -73,12 +75,148 @@ inline NumberType GetNumberOfColors(NumberType ndim) {
   return ndim;
 }
 
+#ifdef __SSE4_1__
 inline uint32_t PopCount(uint32_t value) {
   return _mm_popcnt_u32(value);
 }
 
 inline uint64_t PopCount(uint64_t value) {
   return _mm_popcnt_u64(value);
+}
+#else
+// http://stackoverflow.com/questions/109023/how-to-count-the-number-of-set-bits-in-a-32-bit-integer
+inline uint32_t PopCount(uint32_t value) {
+  // C or C++: use uint32_t
+  value = value - ((value >> 1) & 0x55555555);
+  value = (value & 0x33333333) + ((value >> 2) & 0x33333333);
+  return (((value + (value >> 4)) & 0x0F0F0F0F) * 0x01010101) >> 24;
+}
+
+// http://www.drdobbs.com/parallel/integer-64-bit-optimizations/184405995
+inline uint64_t PopCount(uint64_t value) {
+  value = (value & 0x5555555555555555LU) + (value >> 1 & 0x5555555555555555LU);
+  value = (value & 0x3333333333333333LU) + (value >> 2 & 0x3333333333333333LU);
+  value = value + (value >> 4) & 0x0F0F0F0F0F0F0F0FLU;
+  value = value + (value >> 8);
+  value = value + (value >> 16);
+  value = value + (value >> 32) & 0x0000007F;
+  return value;
+}
+#endif
+
+template <typename NumberType>
+struct MirrorAssignment {
+  MirrorAssignment(NumberType ndim) : ndim_(ndim) {}
+
+  NumberType operator[](NumberType state) const {
+    assert(state < (NumberType(0x01) << ndim_));
+
+    NumberType cycle_offset = state % (ndim_ * 2);
+    if (cycle_offset < ndim_) {
+      return cycle_offset;
+    } else {
+      return 2 * ndim_ - cycle_offset - 1;
+    }
+  }
+
+  NumberType ndim_;
+};
+
+template <typename NumberType, class ColorAssignment>
+bool ValidateColoring(const ColorAssignment& coloring, NumberType ndim) {
+  NumberType n_states = GetNumberOfStates<NumberType>(ndim);
+  NumberType n_colors = ndim;
+
+  for (NumberType current_state = 0; current_state < n_states;
+       ++current_state) {
+    // bit-vector of colors seen among neighbors (including self)
+    NumberType colors_seen = 0;
+    Set(&colors_seen, coloring[current_state]) = 1;
+
+    for (NumberType i = 0; i < ndim; ++i) {
+      NumberType neighbor_state = current_state;
+      if (Get(current_state, i)) {
+        Set(&neighbor_state, i) = 0;
+      } else {
+        Set(&neighbor_state, i) = 1;
+      }
+
+      Set(&colors_seen, coloring[neighbor_state]) = 1;
+    }
+
+    if (PopCount(colors_seen) != n_colors) {
+      fmt::print(
+          std::cout,
+          "For state {1:0{0}b}, saw {2} ({3:0{0}b}) colors, expected {4:d}\n",
+          ndim, current_state, PopCount(colors_seen), colors_seen, n_colors);
+            fmt::print(std::cout, "colors_seen: {:08b}\n", colors_seen);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static const std::string kFormat2 =
+    "\
+  (10) o ----- o (11)   (00) : {0:d} \n\
+       |       |        (01) : {1:d} \n\
+       |       |        (10) : {2:d} \n\
+  (00) o-------o (01)   (11) : {3:d} \n\
+";
+
+static const std::string kFormat3 =
+    "\
+\n\
+    (110) o-------o (111)   (000) : {0:d} \n\
+         /|      /|         (001) : {1:d} \n\
+ (010)  / |     / |         (010) : {2:d} \n\
+       o ----- o  o (101)   (011) : {3:d} \n\
+       | /     | /          (100) : {4:d} \n\
+       |/      |/           (101) : {5:d} \n\
+ (000) o-------o (001)      (110) : {6:d} \n\
+                            (111) : {7:d} \n\
+";
+
+template <typename NumberType, class ColorAssignment>
+void PrintColoring(std::ostream& out, const ColorAssignment& coloring,
+                   NumberType ndim) {
+  switch (ndim) {
+    case 2: {
+      fmt::print(out, kFormat2, coloring[0], coloring[1], coloring[2],
+                 coloring[3]);
+      break;
+    }
+
+    case 3: {
+      fmt::print(out, kFormat3, coloring[0], coloring[1], coloring[2],
+                 coloring[3], coloring[4], coloring[5], coloring[6],
+                 coloring[7]);
+      break;
+    }
+
+    case 4: {
+      break;
+    }
+
+    default:
+      out << "No visualization for dimension " << ndim << "\n";
+  }
+}
+
+int main(int argc, char** argv) {
+  for (uint64_t ndim = 2; ndim < 17; ndim *= ndim) {
+    MirrorAssignment<uint64_t> coloring(ndim);
+    fmt::print(std::cout, "\n\nn = {}, {} states, {} colors\n", ndim,
+               GetNumberOfStates<uint64_t>(ndim),
+               GetNumberOfColors<uint64_t>(ndim));
+
+    PrintColoring(std::cout, coloring, ndim);
+    bool is_valid = ValidateColoring(coloring, ndim);
+    fmt::print(std::cout, "Validated: {}\n", (is_valid ? "yes" : "no"));
+    std::cout.flush();
+  }
+  return 0;
 }
 
 template <typename NumberType>
@@ -94,6 +232,7 @@ struct TopologicalCompare {
   }
 };
 
+// Cycle over colors in topological order
 template <typename NumberType>
 std::vector<NumberType> GenerateColoring(NumberType ndim) {
   NumberType n_states = GetNumberOfStates<NumberType>(ndim);
@@ -136,99 +275,16 @@ std::vector<NumberType> GenerateColoring(NumberType ndim) {
   return result;
 }
 
-template <typename NumberType>
-bool ValidateColoring(const std::vector<NumberType>& coloring,
-                      NumberType ndim) {
-  NumberType n_states = GetNumberOfStates<NumberType>(ndim);
-  NumberType n_colors = GetNumberOfColors<NumberType>(ndim);
-
-  for (NumberType current_state = 0; current_state < n_states;
-       ++current_state) {
-    // bit-vector of colors seen among neighbors (including self)
-    NumberType colors_seen = 0;
-    Set(&colors_seen, coloring[current_state]) = 1;
-
-    for (NumberType i = 0; i < ndim; ++i) {
-      NumberType neighbor_state = current_state;
-      if (Get(current_state, i)) {
-        Set(&neighbor_state, i) = 0;
-      } else {
-        Set(&neighbor_state, i) = 1;
-      }
-
-      Set(&colors_seen, coloring[neighbor_state]) = 1;
-    }
-
-    if (PopCount(colors_seen) != n_colors) {
-      fmt::print(std::cout, "Saw {} colors, expected {}\n",
-                 PopCount(colors_seen), n_colors);
-      fmt::print(std::cout, "colors_seen: {:08b}\n", colors_seen);
-      return false;
-    }
-  }
-
-  return true;
-}
-
-static const std::string kFormat2 =
-    "\
-  (10) o ----- o (11)   (00) : {0:d} \n\
-       |       |        (01) : {1:d} \n\
-       |       |        (10) : {2:d} \n\
-  (00) o-------o (01)   (11) : {3:d} \n\
-";
-
-static const std::string kFormat3 =
-    "\
-\n\
-    (110) o-------o (111)   (000) : {0:d} \n\
-         /|      /|         (001) : {1:d} \n\
- (010)  / |     / |         (010) : {2:d} \n\
-       o ----- o  o (101)   (011) : {3:d} \n\
-       | /     | /          (100) : {4:d} \n\
-       |/      |/           (101) : {5:d} \n\
- (000) o-------o (001)      (110) : {6:d} \n\
-                            (111) : {7:d} \n\
-";
-
-template <typename NumberType>
-void PrintColoring(std::ostream& out, const std::vector<NumberType>& coloring,
-                   NumberType ndim) {
-  switch (ndim) {
-    case 2: {
-      fmt::print(out, kFormat2, coloring[0], coloring[1], coloring[2],
-                 coloring[3]);
-      break;
-    }
-
-    case 3: {
-      fmt::print(out, kFormat3, coloring[0], coloring[1], coloring[2],
-                 coloring[3], coloring[4], coloring[5], coloring[6],
-                 coloring[7]);
-      break;
-    }
-
-    case 4: {
-      break;
-    }
-
-    default:
-      out << "No visualization for dimension " << ndim << "\n";
-  }
-}
-
-typedef uint32_t NumberType;
-
-int main(int argc, char** argv) {
-  for (NumberType ndim = 2; ndim < 5; ++ndim) {
+int old_main(int argc, char** argv) {
+  for (uint32_t ndim = 2; ndim < 5; ++ndim) {
     fmt::print(std::cout, "\n\nn = {}, {} states, {} colors\n", ndim,
-               GetNumberOfStates<NumberType>(ndim),
-               GetNumberOfColors<NumberType>(ndim));
+               GetNumberOfStates<uint32_t>(ndim),
+               GetNumberOfColors<uint32_t>(ndim));
 
-    std::vector<NumberType> coloring = GenerateColoring<NumberType>(ndim);
+    std::vector<uint32_t> coloring = GenerateColoring<uint32_t>(ndim);
+    PrintColoring(std::cout, coloring, ndim);
     bool is_valid = ValidateColoring(coloring, ndim);
     fmt::print(std::cout, "Validated: {}\n", (is_valid ? "yes" : "no"));
-    PrintColoring(std::cout, coloring, ndim);
     std::cout.flush();
   }
   return 0;
